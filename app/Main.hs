@@ -34,7 +34,7 @@ import Development.Shake (
   writeFile',
  )
 import Development.Shake.Classes (Binary)
-import Development.Shake.FilePath (dropDirectory1, joinPath, splitPath, (-<.>), (</>))
+import Development.Shake.FilePath (dropDirectory1, (-<.>), (</>))
 import Development.Shake.Forward (cacheAction, shakeArgsForward)
 import GHC.Generics (Generic)
 import Slick (compileTemplate', convert, substitute)
@@ -128,7 +128,7 @@ buildIndex siteMeta posts' = do
 -- | Find and build all posts
 buildPosts :: SiteMeta -> Action [Post]
 buildPosts siteMeta = do
-  pPaths <- getDirectoryFiles "." [baseDir </> "posts//*.md"]
+  pPaths <- getDirectoryFiles "." [baseDir </> "//*.md"]
   forP pPaths $ buildPost siteMeta
 
 {- | Load a post, process metadata, write it to output, then return the post object
@@ -153,7 +153,7 @@ copyStaticFiles :: Action ()
 copyStaticFiles = do
   filepaths <- getDirectoryFiles baseDir ["assets//*"]
   void $ forP filepaths $ \filepath ->
-    copyFileChanged (baseDir </> filepath) (outputFolder </> joinPath (tail (splitPath filepath)))
+    copyFileChanged (baseDir </> filepath) (outputFolder </> dropDirectory1 filepath)
 
 formatDate :: String -> String
 formatDate humanDate = toIsoDate parsedTime
