@@ -52,7 +52,7 @@ baseDir :: FilePath
 baseDir = "site/"
 
 templateDir :: FilePath
-templateDir = baseDir </> "template/"
+templateDir = baseDir </> "templates/"
 
 metaFile :: FilePath
 metaFile = baseDir </> "meta.yaml"
@@ -97,12 +97,12 @@ type Tag = String
 -- | Data for a blog post
 data Post = Post
   { title :: String
-  , author :: String
+  , author :: Maybe String
   , content :: String
   , url :: String
-  , date :: String
-  , tags :: [Tag]
-  , description :: String
+  , date :: Maybe String
+  , tags :: Maybe [Tag]
+  , description :: Maybe String
   , image :: Maybe String
   }
   deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
@@ -120,16 +120,24 @@ data AtomData = AtomData
 -- | given a list of posts this will build a table of contents
 buildIndex :: SiteMeta -> [Post] -> Action ()
 buildIndex siteMeta posts' = do
-  indexT <- compileTemplate' (templateDir </> "index.html")
+  indexT <- compileTemplate' (templateDir </> "base.html")
   let indexInfo = IndexInfo{posts = posts'}
       indexHTML = T.unpack $ substitute indexT (withSiteMeta siteMeta $ toJSON indexInfo)
   writeFile' (outputFolder </> "index.html") indexHTML
 
+-- Archive page builder
+buildArchive :: SiteMeta -> [Post] -> Action ()
+buildArchive siteMeta posts' = do
+  indexT <- compileTemplate' (templateDir </> "archive.html")
+  let indexInfo = IndexInfo{posts = posts'}
+      indexHTML = T.unpack $ substitute indexT (withSiteMeta siteMeta $ toJSON indexInfo)
+  writeFile' (outputFolder </> "archive.html") indexHTML
+
 -- | Find and build all posts
 buildPosts :: SiteMeta -> Action [Post]
 buildPosts siteMeta = do
-  pPaths <- getDirectoryFiles "." [baseDir </> "//*.md"]
-  forP pPaths $ buildPost siteMeta
+  pPaths <- getDirectoryFiles baseDir ["posts//*.md"]
+  forP (map (baseDir </>) pPaths) $ buildPost siteMeta
 
 {- | Load a post, process metadata, write it to output, then return the post object
 Detects changes to either post content or template
@@ -144,7 +152,7 @@ buildPost siteMeta srcPath = cacheAction ("build" :: T.Text, srcPath) $ do
       withPostUrl = _Object . at "url" ?~ String postUrl
   -- Add additional metadata we've been able to compute
   let fullPostData = withSiteMeta siteMeta . withPostUrl $ postData
-  template <- compileTemplate' (templateDir </> "post.html")
+  template <- compileTemplate' (templateDir </> "base.html")
   writeFile' (outputFolder </> T.unpack postUrl) . T.unpack $ substitute template fullPostData
   convert fullPostData
 
@@ -183,7 +191,9 @@ buildFeed siteMeta posts' = do
   writeFile' (outputFolder </> "atom.xml") . T.unpack $ substitute atomTempl (toJSON atomData)
  where
   mkAtomPost :: Post -> Post
-  mkAtomPost p = p{date = formatDate $ date p}
+  mkAtomPost p = case date p of
+    Just d -> p{date = Just $ formatDate d}
+    Nothing -> p
 
 {- | Specific build rules for the Shake system
   defines workflow to build the website
@@ -191,8 +201,9 @@ buildFeed siteMeta posts' = do
 buildRules :: SiteMeta -> Action ()
 buildRules siteMeta = do
   allPosts <- buildPosts siteMeta
-  buildIndex siteMeta allPosts
-  buildFeed siteMeta allPosts
+  -- buildIndex siteMeta allPosts
+  buildArchive siteMeta allPosts
+  -- buildFeed siteMeta allPosts
   copyStaticFiles
 
 main :: IO ()
