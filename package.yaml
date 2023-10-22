@@ -1,19 +1,18 @@
-name:                slick-template
+name:                slick-site-builder
 version:             0.1.0.0
-github:              "Me/my-site"
+github:              "cordx56/slick-site-builder"
 license:             BSD3
-author:              "Me"
-maintainer:          "example@example.com"
-copyright:           "20XX Me"
+author:              "cordx56"
+maintainer:          "cordx56@cordx.cx"
+copyright:           "2023 cordx56"
 
 extra-source-files:
 - README.md
-- ChangeLog.md
 
-synopsis:            My site built with slick!
+synopsis:            My site builder using Slick.
 category:            Slick-Site
 
-description: My slick Site
+description: Slick site builder
 
 executables:
   build-site:
@@ -35,3 +34,5 @@ executables:
     - aeson
     - lens-aeson
     - time
+    - pandoc
+    - yaml
