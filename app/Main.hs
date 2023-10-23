@@ -7,8 +7,9 @@ module Main where
 
 import Control.Lens (Profunctor (lmap), at, (?~))
 import Control.Monad (void)
-import Data.Aeson (FromJSON, ToJSON, Value (Object, String), toJSON)
-import Data.Aeson.KeyMap (union)
+import Data.Aeson (FromJSON (parseJSON), ToJSON, Value (Object, String), object, toJSON, (.:))
+import Data.Aeson.Key (fromString)
+import Data.Aeson.KeyMap as KeyMap (lookup, singleton, union)
 import Data.Aeson.Lens (_Object)
 import qualified Data.Text as T
 import Data.Time (
@@ -22,6 +23,7 @@ import Data.Time (
 import Data.Yaml (decodeFileEither)
 import Development.Shake (
   Action,
+  FilePattern,
   Verbosity (Verbose),
   copyFileChanged,
   forP,
@@ -34,7 +36,7 @@ import Development.Shake (
   writeFile',
  )
 import Development.Shake.Classes (Binary)
-import Development.Shake.FilePath (dropDirectory1, (-<.>), (</>))
+import Development.Shake.FilePath (dropDirectory1, normaliseEx, splitPath, (-<.>), (</>))
 import Development.Shake.Forward (cacheAction, shakeArgsForward)
 import GHC.Generics (Generic)
 import Slick (compileTemplate', convert, substitute)
@@ -45,18 +47,63 @@ import Text.Pandoc (Extension (Ext_east_asian_line_breaks, Ext_emoji), ReaderOpt
 
 ---Config-----------------------------------------------------------------------
 
-outputFolder :: FilePath
-outputFolder = "docs/"
+configFile :: FilePath
+configFile = "config.yaml"
 
-baseDir :: FilePath
-baseDir = "site/"
+-- Data models-------------------------------------------------------------------
 
-templateDir :: FilePath
-templateDir = baseDir </> "templates/"
+-- | Data for config
+data Config = Config
+  { site :: SiteConfig
+  , srcDir :: FilePath
+  , outputDir :: FilePath
+  , templatesDir :: FilePath
+  , rules :: [Rule]
+  }
+  deriving (Generic, FromJSON)
 
-metaFile :: FilePath
-metaFile = baseDir </> "meta.yaml"
+data SiteConfig = SiteConfig
+  { baseUrl :: String
+  , title :: String
+  }
+  deriving (Generic, FromJSON)
 
+siteConfigToSiteMeta :: SiteConfig -> SiteMeta
+siteConfigToSiteMeta (SiteConfig{baseUrl = u, title = t}) =
+  SiteMeta
+    { baseUrl = u
+    , siteTitle = t
+    }
+
+data Rule = Rule
+  { name :: Maybe String
+  , action :: RuleAction
+  , patterns :: [FilePattern]
+  }
+  deriving (Generic, FromJSON)
+
+data RuleAction
+  = CopyRule
+      { name :: String
+      }
+  | BuildRule
+      { name :: String
+      , template :: FilePath
+      }
+
+instance FromJSON RuleAction where
+  parseJSON (Object v) = case KeyMap.lookup "name" v of
+    (Just "copy") -> CopyRule <$> v .: "name"
+    (Just "build") ->
+      BuildRule
+        <$> v
+        .: "name"
+        <*> v
+        .: "template"
+    _ -> error "unknown rule action"
+  parseJSON _ = error "action must be object"
+
+-- | Pandoc options
 pandocReaderOptions :: ReaderOptions
 pandocReaderOptions =
   def
@@ -69,18 +116,18 @@ pandocReaderOptions =
  where
   defaultOptions = readerExtensions defaultMarkdownOptions
 
--- Data models-------------------------------------------------------------------
-
 withSiteMeta :: SiteMeta -> Value -> Value
 withSiteMeta siteMeta (Object obj) = Object $ union obj siteMetaObj
  where
-  Object siteMetaObj = toJSON siteMeta
+  siteMetaObj = case toJSON siteMeta of
+    Object o -> o
+    _ -> error "type error"
 withSiteMeta _ _ = error "only add site meta to objects"
 
 data SiteMeta = SiteMeta
-  { siteAuthor :: String
-  , baseUrl :: String -- e.g. https://example.ca
+  { baseUrl :: String -- e.g. https://example.ca
   , siteTitle :: String
+  -- , siteAuthor :: String
   -- , twitterHandle :: Maybe String -- Without @
   -- , githubUser :: Maybe String
   }
@@ -96,7 +143,7 @@ type Tag = String
 
 -- | Data for a blog post
 data Post = Post
-  { title :: String
+  { title :: Maybe String
   , author :: Maybe String
   , content :: String
   , url :: String
@@ -107,61 +154,43 @@ data Post = Post
   }
   deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
 
-data AtomData = AtomData
-  { title :: String
-  , domain :: String
-  , author :: String
-  , posts :: [Post]
-  , currentTime :: String
-  , atomUrl :: String
-  }
-  deriving (Generic, ToJSON, Eq, Ord, Show)
-
--- | given a list of posts this will build a table of contents
-buildIndex :: SiteMeta -> [Post] -> Action ()
-buildIndex siteMeta posts' = do
-  indexT <- compileTemplate' (templateDir </> "base.html")
-  let indexInfo = IndexInfo{posts = posts'}
-      indexHTML = T.unpack $ substitute indexT (withSiteMeta siteMeta $ toJSON indexInfo)
-  writeFile' (outputFolder </> "index.html") indexHTML
-
--- Archive page builder
-buildArchive :: SiteMeta -> [Post] -> Action ()
-buildArchive siteMeta posts' = do
-  indexT <- compileTemplate' (templateDir </> "archive.html")
-  let indexInfo = IndexInfo{posts = posts'}
-      indexHTML = T.unpack $ substitute indexT (withSiteMeta siteMeta $ toJSON indexInfo)
-  writeFile' (outputFolder </> "archive.html") indexHTML
-
 -- | Find and build all posts
-buildPosts :: SiteMeta -> Action [Post]
-buildPosts siteMeta = do
-  pPaths <- getDirectoryFiles baseDir ["posts//*.md"]
-  forP (map (baseDir </>) pPaths) $ buildPost siteMeta
+builds :: Config -> [FilePattern] -> FilePath -> Action [Post]
+builds config patts templ = do
+  pPaths <- getDirectoryFiles (srcDir config) patts
+  forP pPaths $ build config templ
 
 {- | Load a post, process metadata, write it to output, then return the post object
 Detects changes to either post content or template
 -}
-buildPost :: SiteMeta -> FilePath -> Action Post
-buildPost siteMeta srcPath = cacheAction ("build" :: T.Text, srcPath) $ do
-  liftIO . putStrLn $ "Rebuilding post: " <> srcPath
-  postContent <- readFile' srcPath
+build :: Config -> FilePath -> FilePath -> Action Post
+build config templName srcPath = cacheAction ("build" :: T.Text, srcFilePath) $ do
+  liftIO . putStrLn $ "Rebuilding post: " <> srcFilePath
+  postContent <- readFile' srcFilePath
   -- load post content and metadata as JSON blob
   postData <- markdownToHTMLWithOpts pandocReaderOptions defaultHtml5Options . T.pack $ postContent
-  let postUrl = T.pack . dropDirectory1 $ srcPath -<.> "html"
+  let postUrl = T.pack $ srcPath -<.> "html"
       withPostUrl = _Object . at "url" ?~ String postUrl
   -- Add additional metadata we've been able to compute
   let fullPostData = withSiteMeta siteMeta . withPostUrl $ postData
-  template <- compileTemplate' (templateDir </> "base.html")
-  writeFile' (outputFolder </> T.unpack postUrl) . T.unpack $ substitute template fullPostData
+  templ <- compileTemplate' templPath
+  writeFile' (outDir </> T.unpack postUrl) . T.unpack $ substitute templ fullPostData
   convert fullPostData
+ where
+  srcFilePath = srcDir config </> srcPath
+  siteMeta = siteConfigToSiteMeta $ site config
+  templPath = templatesDir config </> templName
+  outDir = outputDir config
 
 -- | Copy all static files from the listed folders to their destination
-copyStaticFiles :: Action ()
-copyStaticFiles = do
-  filepaths <- getDirectoryFiles baseDir ["assets//*"]
+copyStaticFiles :: Config -> [FilePattern] -> Action ()
+copyStaticFiles config patts = do
+  filepaths <- getDirectoryFiles baseDir patts
   void $ forP filepaths $ \filepath ->
-    copyFileChanged (baseDir </> filepath) (outputFolder </> dropDirectory1 filepath)
+    copyFileChanged (baseDir </> filepath) (outDir </> filepath)
+ where
+  baseDir = srcDir config
+  outDir = outputDir config
 
 formatDate :: String -> String
 formatDate humanDate = toIsoDate parsedTime
@@ -175,44 +204,44 @@ rfc3339 = Just "%H:%M:%SZ"
 toIsoDate :: UTCTime -> String
 toIsoDate = formatTime defaultTimeLocale (iso8601DateFormat rfc3339)
 
-buildFeed :: SiteMeta -> [Post] -> Action ()
-buildFeed siteMeta posts' = do
-  now <- liftIO getCurrentTime
-  let atomData =
-        AtomData
-          { title = siteTitle siteMeta
-          , domain = baseUrl siteMeta
-          , author = siteAuthor siteMeta
-          , posts = mkAtomPost <$> posts'
-          , currentTime = toIsoDate now
-          , atomUrl = "/atom.xml"
-          }
-  atomTempl <- compileTemplate' (templateDir </> "atom.xml")
-  writeFile' (outputFolder </> "atom.xml") . T.unpack $ substitute atomTempl (toJSON atomData)
- where
-  mkAtomPost :: Post -> Post
-  mkAtomPost p = case date p of
-    Just d -> p{date = Just $ formatDate d}
-    Nothing -> p
+dropDirectoryN :: Int -> FilePath -> FilePath
+dropDirectoryN 0 fp = fp
+dropDirectoryN n fp = dropDirectoryN (n - 1) (dropDirectory1 fp)
+dropDirectory :: FilePath -> FilePath -> FilePath
+dropDirectory src = dropDirectoryN (length $ splitPath $ normaliseEx src)
 
-{- | Specific build rules for the Shake system
-  defines workflow to build the website
--}
-buildRules :: SiteMeta -> Action ()
-buildRules siteMeta = do
-  allPosts <- buildPosts siteMeta
-  -- buildIndex siteMeta allPosts
-  buildArchive siteMeta allPosts
-  -- buildFeed siteMeta allPosts
-  copyStaticFiles
+buildRule :: Config -> Value -> Rule -> Action Value
+buildRule config v (Rule{action = CopyRule{}, patterns = p}) = do
+  copyStaticFiles config p
+  return v
+buildRule config (Object v) (Rule{name = n, action = BuildRule{template = t}, patterns = p}) = do
+  ps <- builds config p t
+  case n of
+    Just na -> return (toJSON $ union (singleton (fromString na) $ toJSON ps) v)
+    Nothing -> return (Object v)
+buildRule _ _ _ = error ""
+
+buildRules :: Config -> Value -> [Rule] -> Action Value
+buildRules config val (r : rs) = do
+  v <- buildRule config val r
+  buildRules config v rs
+buildRules _ val [] = do
+  return val
+
+buildSite :: Config -> Action ()
+buildSite config = do
+  _ <- buildRules config (object []) rls
+  return ()
+ where
+  rls = rules config
 
 main :: IO ()
 main = do
-  metaEither <- decodeFileEither metaFile
-  case metaEither of
+  configEither <- decodeFileEither configFile
+  case configEither of
     Left _ -> do
-      hPrint stderr (metaFile ++ " read error")
+      hPrint stderr (configFile ++ " read error")
       exitWith (ExitFailure 1)
-    Right meta -> do
+    Right config -> do
       let shOpts = shakeOptions{shakeVerbosity = Verbose, shakeLintInside = ["\\"]}
-      shakeArgsForward shOpts $ buildRules meta
+      shakeArgsForward shOpts $ buildSite config
