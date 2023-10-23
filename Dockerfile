@@ -9,5 +9,6 @@ RUN stack install --local-bin-path ./
 
 FROM debian:buster-slim
 WORKDIR /app
+ENV LC_ALL C.UTF-8
 COPY --from=builder /app/build-site /
 CMD ["/build-site"]
