@@ -124,6 +124,10 @@ withSiteMeta siteMeta (Object obj) = Object $ union obj siteMetaObj
     _ -> error "type error"
 withSiteMeta _ _ = error "only add site meta to objects"
 
+unionValues :: Value -> Value -> Value
+unionValues (Object obj1) (Object obj2) = Object $ union obj1 obj2
+unionValues _ _ = error "type error"
+
 data SiteMeta = SiteMeta
   { baseUrl :: String -- e.g. https://example.ca
   , siteTitle :: String
@@ -155,16 +159,15 @@ data Post = Post
   deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
 
 -- | Find and build all posts
-builds :: Config -> [FilePattern] -> FilePath -> Action [Post]
-builds config patts templ = do
-  pPaths <- getDirectoryFiles (srcDir config) patts
-  forP pPaths $ build config templ
+builds :: Config -> Value -> FilePath -> [FilePath] -> Action [Post]
+builds config val templName pPaths = do
+  forP pPaths $ build config val templName
 
 {- | Load a post, process metadata, write it to output, then return the post object
 Detects changes to either post content or template
 -}
-build :: Config -> FilePath -> FilePath -> Action Post
-build config templName srcPath = cacheAction ("build" :: T.Text, srcFilePath) $ do
+build :: Config -> Value -> FilePath -> FilePath -> Action Post
+build config val templName srcPath = cacheAction ("build" :: T.Text, srcFilePath) $ do
   liftIO . putStrLn $ "Rebuilding post: " <> srcFilePath
   postContent <- readFile' srcFilePath
   -- load post content and metadata as JSON blob
@@ -172,7 +175,7 @@ build config templName srcPath = cacheAction ("build" :: T.Text, srcFilePath) $ 
   let postUrl = T.pack $ srcPath -<.> "html"
       withPostUrl = _Object . at "url" ?~ String postUrl
   -- Add additional metadata we've been able to compute
-  let fullPostData = withSiteMeta siteMeta . withPostUrl $ postData
+  let fullPostData = unionValues val $ withSiteMeta siteMeta . withPostUrl $ postData
   templ <- compileTemplate' templPath
   writeFile' (outDir </> T.unpack postUrl) . T.unpack $ substitute templ fullPostData
   convert fullPostData
@@ -183,9 +186,8 @@ build config templName srcPath = cacheAction ("build" :: T.Text, srcFilePath) $ 
   outDir = outputDir config
 
 -- | Copy all static files from the listed folders to their destination
-copyStaticFiles :: Config -> [FilePattern] -> Action ()
-copyStaticFiles config patts = do
-  filepaths <- getDirectoryFiles baseDir patts
+copyStaticFiles :: Config -> [FilePath] -> Action ()
+copyStaticFiles config filepaths = do
   void $ forP filepaths $ \filepath ->
     copyFileChanged (baseDir </> filepath) (outDir </> filepath)
  where
@@ -210,27 +212,49 @@ dropDirectoryN n fp = dropDirectoryN (n - 1) (dropDirectory1 fp)
 dropDirectory :: FilePath -> FilePath -> FilePath
 dropDirectory src = dropDirectoryN (length $ splitPath $ normaliseEx src)
 
-buildRule :: Config -> Value -> Rule -> Action Value
-buildRule config v (Rule{action = CopyRule{}, patterns = p}) = do
-  copyStaticFiles config p
-  return v
-buildRule config (Object v) (Rule{name = n, action = BuildRule{template = t}, patterns = p}) = do
-  ps <- builds config p t
+data BuildState = BuildState
+  { values :: Value
+  , built :: [FilePath]
+  }
+
+getSrcFilesIncludingBuilt :: Config -> [FilePattern] -> Action [FilePath]
+getSrcFilesIncludingBuilt config = do
+  getDirectoryFiles baseDir
+ where
+  baseDir = srcDir config
+getSrcFiles :: Config -> [FilePath] -> [FilePattern] -> Action [FilePath]
+getSrcFiles config bt patts = do
+  includingBuilt <- getSrcFilesIncludingBuilt config patts
+  return $ filter (`notElem` bt) includingBuilt
+
+buildRule :: Config -> BuildState -> Rule -> Action BuildState
+-- copy rule
+buildRule config (BuildState{values = v, built = bt}) (Rule{action = CopyRule{}, patterns = p}) = do
+  filepaths <- getSrcFiles config bt p
+  copyStaticFiles config filepaths
+  return BuildState{values = v, built = bt ++ filepaths}
+-- build rule
+buildRule config (BuildState{values = (Object v), built = bt}) (Rule{name = n, action = BuildRule{template = t}, patterns = p}) = do
+  filepaths <- getSrcFiles config bt p
+  ps <- builds config (toJSON v) t filepaths
+  let newBt = bt ++ filepaths
   case n of
-    Just na -> return (toJSON $ union (singleton (fromString na) $ toJSON ps) v)
-    Nothing -> return (Object v)
+    Just na -> do
+      let newVals = toJSON $ union (singleton (fromString na) $ toJSON ps) v
+      return $ BuildState{values = newVals, built = newBt}
+    Nothing -> return $ BuildState{values = Object v, built = newBt}
 buildRule _ _ _ = error ""
 
-buildRules :: Config -> Value -> [Rule] -> Action Value
-buildRules config val (r : rs) = do
-  v <- buildRule config val r
-  buildRules config v rs
-buildRules _ val [] = do
-  return val
+buildRules :: Config -> BuildState -> [Rule] -> Action BuildState
+buildRules config state (r : rs) = do
+  s <- buildRule config state r
+  buildRules config s rs
+buildRules _ state [] = do
+  return state
 
 buildSite :: Config -> Action ()
 buildSite config = do
-  _ <- buildRules config (object []) rls
+  _ <- buildRules config (BuildState{values = object [], built = []}) rls
   return ()
  where
   rls = rules config
