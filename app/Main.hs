@@ -7,10 +7,13 @@ module Main where
 
 import Control.Lens (Profunctor (lmap), at, (?~))
 import Control.Monad (void)
-import Data.Aeson (FromJSON (parseJSON), ToJSON, Value (Object, String), object, toJSON, (.:))
+import Data.Aeson (FromJSON (parseJSON), ToJSON, Value (Object, String), object, toJSON, (.:), (.:?))
 import Data.Aeson.Key (fromString)
 import Data.Aeson.KeyMap as KeyMap (lookup, singleton, union)
 import Data.Aeson.Lens (_Object)
+import Data.List (sort, sortBy)
+import Data.Ord (comparing)
+import qualified Data.Ord
 import qualified Data.Text as T
 import Data.Time (
   UTCTime,
@@ -84,11 +87,12 @@ data Rule = Rule
 
 data RuleAction
   = CopyRule
-      { name :: String
+      { _crName :: String
       }
   | BuildRule
-      { name :: String
-      , template :: FilePath
+      { _brName :: String
+      , _brTemplate :: FilePath
+      , _brSort :: Maybe Sort
       }
 
 instance FromJSON RuleAction where
@@ -100,8 +104,26 @@ instance FromJSON RuleAction where
         .: "name"
         <*> v
         .: "template"
+        <*> v
+        .:? "sort"
     _ -> error "unknown rule action"
   parseJSON _ = error "action must be object"
+
+data Sort
+  = Asc {_sBy :: Maybe String}
+  | Desc {_sBy :: Maybe String}
+
+instance FromJSON Sort where
+  parseJSON (Object v) = case KeyMap.lookup "order" v of
+    Just "asc" -> Asc <$> v .:? "by"
+    Just "desc" -> Desc <$> v .:? "by"
+    _ -> error "unknown order"
+  parseJSON _ = error "sort must be object"
+
+data BuildState = BuildState
+  { values :: Value
+  , built :: [FilePath]
+  }
 
 -- | Pandoc options
 pandocReaderOptions :: ReaderOptions
@@ -159,15 +181,15 @@ data Post = Post
   deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
 
 -- | Find and build all posts
-builds :: Config -> Value -> FilePath -> [FilePath] -> Action [Post]
-builds config val templName pPaths = do
-  forP pPaths $ build config val templName
+builds :: Config -> BuildState -> FilePath -> [FilePath] -> Action [Post]
+builds config state templName pPaths = do
+  forP pPaths $ build config state templName
 
 {- | Load a post, process metadata, write it to output, then return the post object
 Detects changes to either post content or template
 -}
-build :: Config -> Value -> FilePath -> FilePath -> Action Post
-build config val templName srcPath = cacheAction ("build" :: T.Text, srcFilePath) $ do
+build :: Config -> BuildState -> FilePath -> FilePath -> Action Post
+build config (BuildState{values = val}) templName srcPath = cacheAction ("build" :: T.Text, srcFilePath) $ do
   liftIO . putStrLn $ "Rebuilding post: " <> srcFilePath
   postContent <- readFile' srcFilePath
   -- load post content and metadata as JSON blob
@@ -212,37 +234,43 @@ dropDirectoryN n fp = dropDirectoryN (n - 1) (dropDirectory1 fp)
 dropDirectory :: FilePath -> FilePath -> FilePath
 dropDirectory src = dropDirectoryN (length $ splitPath $ normaliseEx src)
 
-data BuildState = BuildState
-  { values :: Value
-  , built :: [FilePath]
-  }
-
 getSrcFilesIncludingBuilt :: Config -> [FilePattern] -> Action [FilePath]
 getSrcFilesIncludingBuilt config = do
   getDirectoryFiles baseDir
  where
   baseDir = srcDir config
-getSrcFiles :: Config -> [FilePath] -> [FilePattern] -> Action [FilePath]
-getSrcFiles config bt patts = do
+getSrcFiles :: Config -> BuildState -> [FilePattern] -> Action [FilePath]
+getSrcFiles config (BuildState{built = bt}) patts = do
   includingBuilt <- getSrcFilesIncludingBuilt config patts
   return $ filter (`notElem` bt) includingBuilt
 
 buildRule :: Config -> BuildState -> Rule -> Action BuildState
 -- copy rule
 buildRule config (BuildState{values = v, built = bt}) (Rule{action = CopyRule{}, patterns = p}) = do
-  filepaths <- getSrcFiles config bt p
+  filepaths <- getSrcFiles config state p
   copyStaticFiles config filepaths
   return BuildState{values = v, built = bt ++ filepaths}
+ where
+  state = BuildState{values = v, built = bt}
 -- build rule
-buildRule config (BuildState{values = (Object v), built = bt}) (Rule{name = n, action = BuildRule{template = t}, patterns = p}) = do
-  filepaths <- getSrcFiles config bt p
-  ps <- builds config (toJSON v) t filepaths
+buildRule config (BuildState{values = Object v, built = bt}) (Rule{name = n, action = BuildRule{_brTemplate = t, _brSort = srt}, patterns = p}) = do
+  filepaths <- getSrcFiles config state p
+  let sortedFilepaths = case srt of
+        Just Desc{_sBy = Nothing} -> sortBy (comparing Data.Ord.Down) filepaths
+        _ -> sort filepaths
+  psts <- builds config state t sortedFilepaths
   let newBt = bt ++ filepaths
   case n of
     Just na -> do
-      let newVals = toJSON $ union (singleton (fromString na) $ toJSON ps) v
+      let sortedPosts = case srt of
+            Just Asc{_sBy = Just "date"} -> sortBy (\a b -> compare (date a) (date b)) psts
+            Just Desc{_sBy = Just "date"} -> sortBy (\a b -> compare (date b) (date a)) psts
+            _ -> psts
+      let newVals = toJSON $ union (singleton (fromString na) $ toJSON sortedPosts) v
       return $ BuildState{values = newVals, built = newBt}
     Nothing -> return $ BuildState{values = Object v, built = newBt}
+ where
+  state = BuildState{values = Object v, built = bt}
 buildRule _ _ _ = error ""
 
 buildRules :: Config -> BuildState -> [Rule] -> Action BuildState
@@ -263,8 +291,9 @@ main :: IO ()
 main = do
   configEither <- decodeFileEither configFile
   case configEither of
-    Left _ -> do
+    Left e -> do
       hPrint stderr (configFile ++ " read error")
+      hPrint stderr e
       exitWith (ExitFailure 1)
     Right config -> do
       let shOpts = shakeOptions{shakeVerbosity = Verbose, shakeLintInside = ["\\"]}
