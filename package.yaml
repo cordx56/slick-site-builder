@@ -36,3 +36,5 @@ executables:
     - time
     - pandoc
     - yaml
+    - vector
+    - hint
