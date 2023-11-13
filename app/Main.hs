@@ -86,27 +86,22 @@ data Rule = Rule
   deriving (Generic, FromJSON)
 
 data RuleAction
-  = CopyRule
-      { _crName :: String
-      }
+  = CopyRule {}
   | BuildRule
-      { _brName :: String
-      , _brTemplate :: FilePath
+      { _brTemplate :: FilePath
       , _brSort :: Maybe Sort
       }
 
 instance FromJSON RuleAction where
   parseJSON (Object v) = case KeyMap.lookup "name" v of
-    (Just "copy") -> CopyRule <$> v .: "name"
     (Just "build") ->
       BuildRule
         <$> v
-        .: "name"
-        <*> v
         .: "template"
         <*> v
         .:? "sort"
     _ -> error "unknown rule action"
+  parseJSON (String "copy") = pure CopyRule{}
   parseJSON _ = error "action must be object"
 
 data Sort
